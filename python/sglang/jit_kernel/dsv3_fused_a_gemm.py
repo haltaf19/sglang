@@ -38,6 +38,7 @@ def _jit_dsv3_fused_a_gemm_module(hd_in: int, hd_out: int, use_pdl: bool) -> Mod
 
 
 def _dsv3_fused_a_gemm_run(mat_a: torch.Tensor, mat_b: torch.Tensor) -> torch.Tensor:
+    assert mat_a.stride(1) == 1, "mat_a must be row-major [M, K]"
     output = torch.empty(
         (mat_a.shape[0], mat_b.shape[1]),
         device=mat_a.device,

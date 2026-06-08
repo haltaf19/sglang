@@ -31,6 +31,7 @@ from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm
 from cutlass.cute.runtime import from_dlpack
 
+from sglang.kernel_api_logging import debug_kernel_api
 from sglang.srt.utils import get_device_sm
 from sglang.srt.utils.common import direct_register_custom_op
 
@@ -197,16 +198,10 @@ def _dsv3_fused_a_gemm_kernel(
     if warp >= SPLITK:
         cute.arch.griddepcontrol_wait()
         ltid = tid - COMPUTE_THREADS
-        need_wait = cutlass.Boolean(True)
         for kt in cutlass.range_constexpr(num_kt):
             st = kt % nstage
             if kt >= nstage:
-                if need_wait:
-                    cute.arch.mbarrier_wait(empty + st, ((kt // nstage) & 1) ^ 1)
-            if kt + 1 < num_kt and kt + 1 >= nstage:
-                nst = (kt + 1) % nstage
-                nph = (((kt + 1) // nstage) & 1) ^ 1
-                need_wait = not cute.arch.mbarrier_try_wait(empty + nst, nph)
+                cute.arch.mbarrier_wait(empty + st, ((kt // nstage) & 1) ^ 1)
             _load_stage(ltid, feat0, sA, sB, mW, mA, kt, st, M, kgi, tile_n)
             cute.arch.cp_async_mbarrier_arrive_noinc(full + st)
     else:
@@ -289,6 +284,8 @@ def _dsv3_fused_a_gemm_host(
     _dsv3_fused_a_gemm_kernel(mW, mA, mOut, M, num_kt, nstage, tile_n).launch(
         grid=[gemm_m // TILE_M, 1, 1],
         block=[NTHREADS, 1, 1],
+        max_number_threads=[NTHREADS, 1, 1],
+        min_blocks_per_mp=1,
         smem=smem_bytes,
         use_pdl=True,
         stream=stream,
@@ -345,11 +342,9 @@ def _dsv3_fused_a_gemm_run(mat_a: torch.Tensor, mat_b: torch.Tensor) -> torch.Te
         tuple(mat_b.shape) == (K, N) and mat_b.stride(0) == 1
     ), "mat_b must be [K, N] column-major"
     assert 1 <= M <= 16, "num_tokens must be in [1, 16]"
+    assert mat_a.stride(1) == 1, "mat_a must be row-major [M, K]"
 
-    mat_a = mat_a.contiguous()
     weight = mat_b.t()
-    if not weight.is_contiguous():
-        weight = weight.contiguous()
     out = torch.empty(M, N, dtype=torch.bfloat16, device=mat_a.device)
 
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
@@ -375,14 +370,15 @@ direct_register_custom_op(
 )
 
 
+@debug_kernel_api
 def dsv3_fused_a_gemm(
-    mat_a: torch.Tensor, mat_b: torch.Tensor, out: torch.Tensor | None = None
+    mat_a: torch.Tensor, mat_b: torch.Tensor, output: torch.Tensor | None = None
 ) -> torch.Tensor:
     """out[M, N] = mat_a[M, K] @ mat_b, with mat_a row-major [M, K] (M in [1, 16]),
     mat_b column-major [K, N] (the weight, stride(0) == 1), N a multiple of 16
     (e.g. 2112, 6144), K a multiple of 1024."""
     result = torch.ops.sglang.cutedsl_dsv3_fused_a_gemm(mat_a, mat_b)
-    if out is not None:
-        out.copy_(result)
-        return out
+    if output is not None:
+        output.copy_(result)
+        return output
     return result
